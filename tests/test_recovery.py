@@ -146,6 +146,107 @@ def test_crash_after_receive_then_recover_on_restart(tmp_path):
         proc.wait(timeout=10)
 
 
+def test_two_ids_same_payload_one_crashes_then_restart_recovers(tmp_path):
+    """验收：两个标识使用相同摘要和额度，其中一次接收后断电并重启恢复。
+
+    核对：两份发布均完成；接收端有两份对应回执且交付次数各为 1；额度只按
+    两次提交扣减；同标识重传幂等、改载荷冲突、第三个同载荷标识超额拒绝。
+    """
+    port = _free_port()
+    data_file = str(tmp_path / "ledger.json")
+    summary = "两个标识共用的相同摘要"
+    amount = 4
+
+    proc = _start(port, data_file, auto_recover=False)
+    try:
+        _wait_health(port)
+        status, first = _post(port, {"publication_id": "PUB-DUP-A", "summary": summary, "amount": amount})
+        assert status == 200 and first["stage"] == "completed"
+
+        # 第二份：相同摘要与额度，但选择“接收后断电”
+        crashed = False
+        try:
+            _post(port, {
+                "publication_id": "PUB-DUP-B", "summary": summary, "amount": amount,
+                "crash_after_receive": True,
+            })
+        except (urllib.error.URLError, ConnectionError, ConnectionResetError):
+            crashed = True
+        assert crashed
+        proc.wait(timeout=10)
+        assert proc.returncode == 99
+
+        # 磁盘现场：两份发布（A 完成、B 冻结），接收端两份独立回执
+        with open(data_file, encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        assert on_disk["publications"]["PUB-DUP-A"]["stage"] == "completed"
+        assert on_disk["publications"]["PUB-DUP-B"]["stage"] == "frozen"
+        assert set(on_disk["deliveries"]) == {"PUB-DUP-A", "PUB-DUP-B"}
+        for pub_id in ("PUB-DUP-A", "PUB-DUP-B"):
+            d = on_disk["deliveries"][pub_id]
+            assert d["delivered_count"] == 1
+            assert d["summary"] == summary and d["amount"] == amount
+            assert d["receipt_id"] == on_disk["publications"][pub_id]["receipt_id"]
+        assert (
+            on_disk["deliveries"]["PUB-DUP-A"]["receipt_id"]
+            != on_disk["deliveries"]["PUB-DUP-B"]["receipt_id"]
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    # 重开并自动恢复：两份均完成，额度只扣两次（4+4=8，可用 2）
+    proc = _start(port, data_file, auto_recover=True)
+    try:
+        _wait_health(port)
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state") as resp:
+            state = json.loads(resp.read())
+        assert {p["publication_id"]: p["stage"] for p in state["publications"]} == {
+            "PUB-DUP-A": "completed", "PUB-DUP-B": "completed",
+        }
+        assert state["frozen_amount"] == 0
+        assert state["used"] == 8 and state["available"] == 2
+        by_id = {d["publication_id"]: d for d in state["deliveries"]}
+        assert set(by_id) == {"PUB-DUP-A", "PUB-DUP-B"}
+        for d in by_id.values():
+            assert d["delivered_count"] == 1
+            assert d["summary"] == summary and d["amount"] == amount
+        receipts_a = {d["receipt_id"] for d in state["deliveries"]}
+        assert len(receipts_a) == 2
+
+        # 同标识同载荷重传：原回执、不再扣额
+        status, retry = _post(port, {"publication_id": "PUB-DUP-B", "summary": summary, "amount": amount})
+        assert status == 200
+        assert retry["receipt_id"] == by_id["PUB-DUP-B"]["receipt_id"]
+        assert retry["state"]["available"] == 2
+
+        # 改摘要/改额度：冲突
+        assert _post(port, {"publication_id": "PUB-DUP-B", "summary": "改过的摘要", "amount": amount})[0] == 409
+        assert _post(port, {"publication_id": "PUB-DUP-B", "summary": summary, "amount": 3})[0] == 409
+
+        # 第三个同载荷新标识：8+4>10，超额拒绝且接收端不新增回执
+        status, _ = _post(port, {"publication_id": "PUB-DUP-C", "summary": summary, "amount": amount})
+        assert status == 402
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+    # 再次重开：稳定收敛，仍为两份发布/两份回执/次数各 1
+    proc = _start(port, data_file, auto_recover=True)
+    try:
+        _wait_health(port)
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state") as resp:
+            final_state = json.loads(resp.read())
+        assert len(final_state["publications"]) == 2
+        assert len(final_state["deliveries"]) == 2
+        assert all(d["delivered_count"] == 1 for d in final_state["deliveries"])
+        assert final_state["frozen_amount"] == 0
+        assert final_state["available"] == 2
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+
 def test_auto_recover_on_boot(tmp_path):
     port = _free_port()
     data_file = str(tmp_path / "ledger.json")

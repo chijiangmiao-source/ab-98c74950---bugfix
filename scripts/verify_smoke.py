@@ -239,6 +239,105 @@ def step_crash_recovery() -> None:
         proc.wait(timeout=10)
 
 
+def step_duplicate_payload_crash_recovery() -> None:
+    print("\n== 4) 两个标识相同摘要与额度：一次接收后断电 + 重开恢复 ==")
+    port = _free_port()
+    data_dir = tempfile.mkdtemp(prefix="dup-ledger-")
+    data_file = os.path.join(data_dir, "ledger.json")
+    url = f"http://127.0.0.1:{port}"
+    summary, amount = "两个标识共用的相同摘要", 3
+
+    proc = _start_local(port, data_file, auto_recover=False)
+    try:
+        check("双标识演练实例就绪", wait_health(url))
+        status, first = http("POST", f"{url}/api/deliveries",
+                             {"publication_id": "DUP-A", "summary": summary, "amount": amount})
+        check("首标识交付受理（200）", status == 200 and first.get("stage") == "completed")
+        receipt_a = first.get("receipt_id")
+
+        crashed = False
+        try:
+            http("POST", f"{url}/api/deliveries",
+                 {"publication_id": "DUP-B", "summary": summary, "amount": amount,
+                  "crash_after_receive": True}, timeout=5)
+        except (urllib.error.URLError, ConnectionError, ConnectionResetError):
+            crashed = True
+        check("第二标识接收后断电（连接中断，退出码 99）", crashed)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        check("断电退出码为 99", proc.returncode == 99, f"rc={proc.returncode}")
+
+        on_disk = json.load(open(data_file, encoding="utf-8"))
+        check("磁盘现场：两份发布（A 完成、B 冻结）",
+              on_disk["publications"]["DUP-A"]["stage"] == "completed"
+              and on_disk["publications"]["DUP-B"]["stage"] == "frozen")
+        check("磁盘现场：接收端两份独立回执，次数各 1",
+              set(on_disk.get("deliveries", {})) == {"DUP-A", "DUP-B"}
+              and all(on_disk["deliveries"][k]["delivered_count"] == 1 for k in ("DUP-A", "DUP-B")))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    proc = _start_local(port, data_file, auto_recover=True)
+    try:
+        check("双标识演练重开就绪", wait_health(url))
+        status, state = http("GET", f"{url}/api/state")
+        stages = {p["publication_id"]: p["stage"] for p in state.get("publications", [])}
+        check("重开后两份发布均完成", stages == {"DUP-A": "completed", "DUP-B": "completed"}, str(stages))
+        check("额度只按两次提交扣减（已用 6、可用 4）",
+              state.get("used") == 6 and state.get("available") == 4
+              and state.get("frozen_amount") == 0)
+        by_id = {d["publication_id"]: d for d in state.get("deliveries", [])}
+        check("接收端两份回执且交付次数各为 1",
+              set(by_id) == {"DUP-A", "DUP-B"}
+              and all(d["delivered_count"] == 1 for d in by_id.values()))
+        check("两份回执互不相同且按各自标识派生",
+              by_id.get("DUP-A", {}).get("receipt_id") == receipt_a
+              and by_id["DUP-A"]["receipt_id"] != by_id.get("DUP-B", {}).get("receipt_id"))
+
+        # 同标识同载荷重传：原回执、不再扣额
+        status, retry = http("POST", f"{url}/api/deliveries",
+                             {"publication_id": "DUP-B", "summary": summary, "amount": amount})
+        check("B 同载荷重传返回原回执且不扣额",
+              status == 200 and retry.get("receipt_id") == by_id["DUP-B"]["receipt_id"]
+              and retry.get("state", {}).get("available") == 4)
+
+        # 改摘要/改额度：409
+        check("B 改摘要冲突 409",
+              http("POST", f"{url}/api/deliveries",
+                   {"publication_id": "DUP-B", "summary": "被改动", "amount": amount})[0] == 409)
+        check("B 改额度冲突 409",
+              http("POST", f"{url}/api/deliveries",
+                   {"publication_id": "DUP-B", "summary": summary, "amount": 2})[0] == 409)
+
+        # 第三个新标识再消耗 5：6+5>10 → 402
+        check("第三个新标识超额拒绝 402",
+              http("POST", f"{url}/api/deliveries",
+                   {"publication_id": "DUP-C", "summary": "另一批摘要", "amount": 5})[0] == 402)
+        status, state = http("GET", f"{url}/api/state")
+        check("拒绝后接收端仍只有两份回执",
+              {d["publication_id"] for d in state.get("deliveries", [])} == {"DUP-A", "DUP-B"})
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+    # 再次重开：稳定收敛
+    proc = _start_local(port, data_file, auto_recover=True)
+    try:
+        check("双标识演练再次重开就绪", wait_health(url))
+        status, state = http("GET", f"{url}/api/state")
+        check("最终：两份发布、两份回执、次数各 1、无冻结",
+              len(state.get("publications", [])) == 2
+              and len(state.get("deliveries", [])) == 2
+              and all(d["delivered_count"] == 1 for d in state["deliveries"])
+              and state.get("frozen_amount") == 0 and state.get("available") == 4)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+
 def main() -> int:
     # 先启动代码测试，使其与页面构建、HTTP 冒烟、断电演练并行
     test_proc = subprocess.Popen(
@@ -249,6 +348,7 @@ def main() -> int:
         step_build_page()
         step_http_smoke()
         step_crash_recovery()
+        step_duplicate_payload_crash_recovery()
     finally:
         test_proc.wait()
     test_rc = test_proc.returncode
@@ -261,7 +361,7 @@ def main() -> int:
         print(f"verify 失败项：{FAILURES}")
         print("RESULT: FAIL")
         return 1
-    print("RESULT: PASS —— 页面构建、HTTP 冒烟（额度拒绝/幂等/冲突/断电恢复）、代码测试全部通过")
+    print("RESULT: PASS —— 页面构建、HTTP 冒烟（额度拒绝/幂等/冲突/断电恢复/双标识同载荷）、代码测试全部通过")
     return 0
 
 

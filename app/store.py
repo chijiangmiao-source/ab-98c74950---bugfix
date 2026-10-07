@@ -3,7 +3,8 @@
 一个 JSON 文件承载两部分概念上独立的数据：
 
 - ``publications``：本端（数据官/发送方）额度账本，按稳定发布标识索引；
-- ``deliveries`` ：接收端持久化的交付记录（首份摘要与回执），按同一标识索引。
+- ``deliveries`` ：接收端持久化的交付记录（每个发布标识各自的首份摘要
+  与回执），按同一标识索引。
 
 每次写入整库序列化到同目录临时文件，``fsync`` 后以 ``os.replace`` 原子
 替换。进程在两次落盘之间被硬杀（模拟断电）时，磁盘上只可能是完整的旧版
@@ -27,7 +28,6 @@ class JsonStore:
             "version": 1,
             "publications": {},
             "deliveries": {},
-            "delivery_payloads": {},
         }
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as fh:
@@ -39,7 +39,6 @@ class JsonStore:
                 self.data.update(loaded)
         self.data.setdefault("publications", {})
         self.data.setdefault("deliveries", {})
-        self.data.setdefault("delivery_payloads", {})
 
     def flush(self) -> None:
         """将当前内存状态原子落盘（调用方须持有 ``self.lock``）。"""

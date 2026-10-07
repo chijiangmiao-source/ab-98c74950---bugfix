@@ -52,6 +52,30 @@ def test_delivery_rejection_conflict_and_idempotency(tmp_path):
     assert body["state"]["available"] == 4
 
 
+def test_two_ids_with_identical_payload_get_two_receipts(tmp_path):
+    """不同发布标识、相同摘要与额度：两份发布与两份回执，各扣一次额度。"""
+    client = make_app(tmp_path).test_client()
+    body = {"summary": "完全相同的摘要", "amount": 4}
+
+    a = client.post("/api/deliveries", json={"publication_id": "PUB-A", **body})
+    b = client.post("/api/deliveries", json={"publication_id": "PUB-B", **body})
+    assert a.status_code == b.status_code == 200
+    assert a.get_json()["receipt_id"] != b.get_json()["receipt_id"]
+
+    state = client.get("/api/state").get_json()
+    assert len(state["publications"]) == 2
+    assert len(state["deliveries"]) == 2
+    assert {d["publication_id"] for d in state["deliveries"]} == {"PUB-A", "PUB-B"}
+    assert all(d["delivered_count"] == 1 for d in state["deliveries"])
+    assert state["available"] == 2 and state["used"] == 8
+
+    # 第三个同载荷新标识超额拒绝，接收端不新增回执
+    rejected = client.post("/api/deliveries", json={"publication_id": "PUB-C", **body})
+    assert rejected.status_code == 402
+    state = client.get("/api/state").get_json()
+    assert len(state["deliveries"]) == 2
+
+
 def test_bad_payload_returns_400(tmp_path):
     client = make_app(tmp_path).test_client()
     assert client.post("/api/deliveries", json={"publication_id": "", "summary": "x", "amount": 1}).status_code == 400

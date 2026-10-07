@@ -93,6 +93,7 @@ def create_app(
         with store.lock:
             store.data["publications"] = {}
             store.data["deliveries"] = {}
+            store.data.pop("delivery_payloads", None)
             store.flush()
         return jsonify({"ok": True, "state": ledger.state()})
 
