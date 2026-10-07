@@ -1,0 +1,35 @@
+services:
+  delivery:
+    build: .
+    image: anonymous-stats-delivery:latest
+    environment:
+      TOTAL_QUOTA: "${TOTAL_QUOTA:-10}"
+      AUTO_RECOVER: "1"
+      # 供 verify 冒烟复位账本；生产部署可置 0 关闭 /internal/reset。
+      ALLOW_RESET: "1"
+    ports:
+      # 宿主端口可配置：HOST_PORT=9090 docker compose up delivery
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      - ledger-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=2); sys.exit(0 if json.load(r)['status']=='ok' else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  verify:
+    build: .
+    image: anonymous-stats-delivery:latest
+    depends_on:
+      delivery:
+        condition: service_healthy
+    environment:
+      DELIVERY_URL: "http://delivery:8080"
+    # 先构建交付页面并检查，再以 API/HTTP 冒烟复核额度拒绝与断电恢复，
+    # 同时运行代码测试；完成即退出，退出码即最终结果。
+    command: ["python", "scripts/verify_smoke.py"]
+    restart: "no"
+
+volumes:
+  ledger-data:
