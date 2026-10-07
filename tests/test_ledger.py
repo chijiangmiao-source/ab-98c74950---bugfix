@@ -5,7 +5,14 @@ import threading
 
 import pytest
 
-from app.services import ConflictError, LedgerService, QuotaExceededError, receipt_id_for
+from app.services import (
+    ConflictError,
+    LedgerService,
+    QuotaExceededError,
+    delivery_payload_key,
+    fingerprint,
+    receipt_id_for,
+)
 from app.store import JsonStore
 
 
@@ -121,3 +128,114 @@ def test_receiver_keeps_first_summary_and_receipt(ledger):
     with ledger.store.lock:
         delivery = ledger.store.data["deliveries"]["PUB-R"]
     assert delivery["summary"] == "首份摘要"
+
+
+def test_two_publications_same_payload_are_independent_deliveries(ledger):
+    """两个稳定标识提交完全相同的摘要与额度：各自独立的记录/回执/计数。"""
+    first = ledger.submit("PUB-1", "完全相同的匿名摘要", 3)
+    second = ledger.submit("PUB-2", "完全相同的匿名摘要", 3)
+
+    # 两份发布均完成，回执互不相同（回执只由各自发布标识派生）
+    assert first["stage"] == "completed"
+    assert second["stage"] == "completed"
+    assert first["receipt_id"] == receipt_id_for("PUB-1")
+    assert second["receipt_id"] == receipt_id_for("PUB-2")
+    assert first["receipt_id"] != second["receipt_id"]
+
+    state = ledger.state()
+    # 额度按两次提交分别扣减：3 + 3 = 6
+    assert state["used"] == 6
+    assert state["available"] == 4
+    assert [p["publication_id"] for p in state["publications"]] == ["PUB-1", "PUB-2"]
+    # 接收端保留两份各自的接收记录，交付次数各为 1
+    assert [(d["publication_id"], d["receipt_id"], d["delivered_count"]) for d in state["deliveries"]] == [
+        ("PUB-1", receipt_id_for("PUB-1"), 1),
+        ("PUB-2", receipt_id_for("PUB-2"), 1),
+    ]
+
+    # 同标识重传仍返回各自原回执、不扣额、交付次数不增加
+    again_1 = ledger.submit("PUB-1", "完全相同的匿名摘要", 3)
+    again_2 = ledger.submit("PUB-2", "完全相同的匿名摘要", 3)
+    assert again_1["receipt_id"] == first["receipt_id"]
+    assert again_2["receipt_id"] == second["receipt_id"]
+    state = ledger.state()
+    assert state["available"] == 4
+    assert all(d["delivered_count"] == 1 for d in state["deliveries"])
+    assert len(state["deliveries"]) == 2
+
+
+def test_legacy_shared_delivery_ledger_converges_after_reopen(tmp_path):
+    """旧版本受影响账本重开：补建缺失的本标识接收记录并安全收敛。"""
+    import json
+
+    data_file = tmp_path / "legacy.json"
+    shared_delivery = {
+        "publication_id": "PUB-A",
+        "summary": "相同摘要",
+        "summary_fingerprint": fingerprint("相同摘要"),
+        "amount": 3,
+        "receipt_id": receipt_id_for("PUB-A"),
+        "delivered_count": 1,
+        "accepted_at": 1000.0,
+    }
+    # 旧版本磁盘现场：
+    # - PUB-A 正常完成；PUB-B 相同载荷“接收后断电”永久 frozen；
+    # - 接收端只有 PUB-A 的记录，跨标识载荷索引指向 PUB-A；
+    # - PUB-C 在接收端落盘前断电（载荷索引无记录），应保持 frozen。
+    on_disk = {
+        "version": 1,
+        "publications": {
+            "PUB-A": {
+                "publication_id": "PUB-A", "summary": "相同摘要",
+                "summary_fingerprint": fingerprint("相同摘要"), "amount": 3,
+                "stage": "completed", "receipt_id": receipt_id_for("PUB-A"),
+                "frozen_at": 1000.0, "completed_at": 1001.0,
+            },
+            "PUB-B": {
+                "publication_id": "PUB-B", "summary": "相同摘要",
+                "summary_fingerprint": fingerprint("相同摘要"), "amount": 3,
+                "stage": "frozen", "receipt_id": receipt_id_for("PUB-B"),
+                "frozen_at": 1002.0, "completed_at": None,
+            },
+            "PUB-C": {
+                "publication_id": "PUB-C", "summary": "另一摘要",
+                "summary_fingerprint": fingerprint("另一摘要"), "amount": 2,
+                "stage": "frozen", "receipt_id": receipt_id_for("PUB-C"),
+                "frozen_at": 1003.0, "completed_at": None,
+            },
+        },
+        "deliveries": {"PUB-A": shared_delivery},
+        "delivery_payloads": {delivery_payload_key("相同摘要", 3): dict(shared_delivery)},
+    }
+    data_file.write_text(json.dumps(on_disk), encoding="utf-8")
+
+    ledger = LedgerService(JsonStore(str(data_file)), total_quota=10)
+
+    with ledger.store.lock:
+        # 迁移只补建有旧版本共享痕迹的 PUB-B，不臆造 PUB-C 的接收证据
+        assert set(ledger.store.data["deliveries"]) == {"PUB-A", "PUB-B"}
+        assert "delivery_payloads" not in ledger.store.data
+        repaired = ledger.store.data["deliveries"]["PUB-B"]
+    assert repaired["receipt_id"] == receipt_id_for("PUB-B")
+    assert repaired["delivered_count"] == 1
+    assert repaired["repaired_from_legacy"] is True
+
+    recovered = ledger.recover_pending()
+    assert [p["publication_id"] for p in recovered] == ["PUB-B"]
+    state = ledger.state()
+    stages = {p["publication_id"]: p["stage"] for p in state["publications"]}
+    assert stages == {"PUB-A": "completed", "PUB-B": "completed", "PUB-C": "frozen"}
+    receipts = {d["publication_id"]: d["receipt_id"] for d in state["deliveries"]}
+    assert receipts == {"PUB-A": receipt_id_for("PUB-A"), "PUB-B": receipt_id_for("PUB-B")}
+    # 无错误完成（PUB-C 仍冻结）也无永久冻结（PUB-B 已收敛）；额度 = 3+3+2
+    assert state["frozen_amount"] == 2
+    assert state["available"] == 2
+
+    # PUB-C 随后以相同载荷重传：补接收并自愈收敛，不二次扣额
+    healed = ledger.submit("PUB-C", "另一摘要", 2)
+    assert healed["stage"] == "completed"
+    state = ledger.state()
+    assert state["frozen_amount"] == 0
+    assert state["available"] == 2
+    assert [d["publication_id"] for d in state["deliveries"]] == ["PUB-A", "PUB-B", "PUB-C"]
+    assert all(d["delivered_count"] == 1 for d in state["deliveries"])

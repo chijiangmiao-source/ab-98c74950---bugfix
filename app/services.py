@@ -4,20 +4,25 @@
 
 1. 本端按稳定发布标识写入 ``frozen`` 记录并落盘——额度被冻结，计入
    “未终结保留额”，回执标识由发布标识确定性派生，两边共享；
-2. 接收端接受交付，持久化**首份**摘要与回执（交付次数 1）；
+2. 接收端接受交付，**按发布标识**持久化该标识自己的摘要与回执（交付次数
+   1）；
 3. 本端将 ``frozen`` 收敛为 ``completed`` 并落盘，发布终结。
 
 “接收后断电”（``crash_after_receive=True``）：步骤 2 落盘后、步骤 3
-之前以 ``os._exit`` 硬退出。磁盘现场为：接收端持有冻结回执且交付次数为
-1，本端发布停留在 ``frozen``、额度仍被保留。重开时 :meth:`recover_pending`
-按发布标识查询接收端冻结回执，将原发布收敛为 ``completed``，全程只有一条
-发布记录、一份回执、一次额度冻结。
+之前以 ``os._exit`` 硬退出。磁盘现场为：接收端持有该标识的冻结回执且
+交付次数为 1，本端发布停留在 ``frozen``、额度仍被保留。重开时
+:meth:`recover_pending` 按发布标识查询接收端冻结回执，将原发布收敛为
+``completed``。
 
 不变量：
 
 - 已完成消耗 + 未终结冻结保留额之和不得超过总额度；
-- 同一标识相同载荷重传/并发提交幂等返回原回执，不再扣额；
-- 同一标识改动摘要或额度 → 冲突，不新增回执、不改变额度；
+- **每个稳定发布标识各自独立**：即使两个标识提交的匿名摘要与消耗额度
+  完全相同，接收端也分别持有两条接收记录、两份不同回执，交付次数各为
+  1，额度按两次提交分别扣减；恢复时只按本标识查本标识的接收证据，绝不
+  复用另一标识的记录；
+- 同一标识相同载荷重传/并发提交幂等返回原回执，不再扣额、交付次数仍为
+  1；同一标识改动摘要或额度 → 冲突，不新增回执、不改变额度；
 - 接收端首份摘要与回执一旦持久化永不被覆盖。
 """
 from __future__ import annotations
@@ -61,6 +66,9 @@ class LedgerService:
         # 同一发布标识的并发提交在此串行化，配合持久化保证“只形成一条”。
         self._pub_locks: dict[str, threading.Lock] = {}
         self._pub_locks_guard = threading.Lock()
+        # 修复早期版本“按载荷跨标识共享接收记录”的遗留账本，须在任何
+        # 恢复/写入之前完成，使重开后的 frozen 发布能按自身标识收敛。
+        self._migrate_legacy_shared_deliveries()
 
     # -- 内部工具 ---------------------------------------------------------
 
@@ -84,13 +92,77 @@ class LedgerService:
             and int(record["amount"]) == int(amount)
         )
 
+    # -- 遗留账本迁移 -----------------------------------------------------
+
+    def _migrate_legacy_shared_deliveries(self) -> None:
+        """把旧版本跨标识共享的接收证据修复为按标识独立的接收记录。
+
+        旧版本接收端额外维护 ``delivery_payloads``（摘要指纹+额度）索引，
+        第二个标识以相同载荷提交时只返回首份标识的接收记录、不写入自己的
+        ``deliveries[pub_id]``：发布看似完成却没有本标识回执；若当时选择
+        “接收后断电”，重开后因查不到本标识回执而永久 frozen。
+
+        修复判据（仅凭磁盘现场即可严格区分两类 frozen）：
+
+        - 旧版本中 ``deliveries[pub_id]`` 缺失，当且仅当阶段二走了载荷
+          复用分支，而 ``delivery_payloads`` 里必有与该发布载荷匹配的条
+          目——据此可以安全地按本端发布记录补建该标识自己的接收记录；
+        - 若载荷索引中没有匹配条目，说明断电发生在阶段二之前（接收证据
+          从未落盘），保持 frozen 不动，留待恢复重试或相同载荷重传自愈。
+        """
+        with self.store.lock:
+            data = self.store.data
+            publications = data.get("publications", {})
+            deliveries = data.get("deliveries", {})
+            legacy_index = data.get("delivery_payloads")
+            legacy_payloads = legacy_index if isinstance(legacy_index, dict) else {}
+            changed = False
+            now = time.time()
+
+            for pub_id, publication in publications.items():
+                if pub_id in deliveries:
+                    continue
+                amount = int(publication["amount"])
+                summary = publication.get("summary", "")
+                shared = legacy_payloads.get(delivery_payload_key(summary, amount))
+                if shared is None:
+                    # 无旧版本共享痕迹：不是被错误吞掉的接收，保持现状。
+                    continue
+                deliveries[pub_id] = {
+                    "publication_id": pub_id,
+                    "summary": summary,
+                    "summary_fingerprint": publication.get(
+                        "summary_fingerprint", fingerprint(summary)
+                    ),
+                    "amount": amount,
+                    # 回执只属于本发布标识；与阶段一本端记录保持一致。
+                    "receipt_id": publication.get("receipt_id") or receipt_id_for(pub_id),
+                    "delivered_count": 1,
+                    "accepted_at": shared.get("accepted_at", publication.get("frozen_at") or now),
+                    # 标记此记录由遗留账本修复补建，便于事后核对。
+                    "repaired_from_legacy": True,
+                    "repaired_at": now,
+                }
+                changed = True
+
+            # 跨标识载荷索引已废弃：新账本内存中不再含此键；旧账本一旦
+            # 出现（无论是否为空）就移除并落盘一次，保证磁盘最终干净。
+            if legacy_index is not None:
+                del data["delivery_payloads"]
+                changed = True
+
+            if changed:
+                self.store.flush()
+
     # -- 接收端 -----------------------------------------------------------
 
     def receiver_accept(self, pub_id: str, summary: str, amount: int) -> dict[str, Any]:
-        """接收端接受交付，返回交付记录（含唯一回执）。
+        """接收端接受交付，返回该发布标识自己的交付记录（含唯一回执）。
 
-        首份摘要与回执在此生成并持久化；相同载荷重复/并发投递直接返回原
-        记录（交付次数不增加）；不同载荷冲突，绝不覆盖首份摘要。
+        接收记录**只按发布标识索引**：不同标识即便摘要与额度完全相同，
+        也各自独立持久化、各自持有回执、交付次数各计 1。同一标识的重复/
+        并发投递直接返回原记录（交付次数不增加）；同一标识不同载荷冲突，
+        绝不覆盖首份摘要。
         """
         with self.store.lock:
             delivery = self.store.data["deliveries"].get(pub_id)
@@ -98,12 +170,6 @@ class LedgerService:
                 if not self._same_payload(delivery, summary, amount):
                     raise ConflictError("接收端已存在不同载荷的首份交付")
                 return dict(delivery)
-            payload_key = delivery_payload_key(summary, amount)
-            shared_delivery = self.store.data["delivery_payloads"].get(payload_key)
-            if shared_delivery is not None:
-                if not self._same_payload(shared_delivery, summary, amount):
-                    raise ConflictError("接收端已存在不同载荷的首份交付")
-                return dict(shared_delivery)
             delivery = {
                 "publication_id": pub_id,
                 "summary": summary,
@@ -114,7 +180,6 @@ class LedgerService:
                 "accepted_at": time.time(),
             }
             self.store.data["deliveries"][pub_id] = delivery
-            self.store.data["delivery_payloads"][payload_key] = dict(delivery)
             self.store.flush()
             return dict(delivery)
 
@@ -133,11 +198,13 @@ class LedgerService:
                             f"发布标识 {pub_id} 已存在，但摘要或消耗额度不一致"
                         )
                     # 相同载荷重传：幂等返回原记录/回执。若上一任在终结前
-                    # 断电（frozen）且接收端回执已在，则顺手收敛。
+                    # 断电（frozen），按本标识查接收证据：证据已在则直接收
+                    # 敛；证据缺失（断电早于接收端落盘的极端窗口）则先补接
+                    # 收再收敛，交付次数仍为 1、不二次扣额。
                     if existing["stage"] == "frozen":
-                        delivery = self.store.data["deliveries"].get(pub_id)
-                        if delivery is not None:
-                            return self._complete(pub_id)
+                        if self.store.data["deliveries"].get(pub_id) is None:
+                            self.receiver_accept(pub_id, summary, amount)
+                        return self._complete(pub_id)
                     return dict(existing)
 
                 used_others = self._used({k: v for k, v in publications.items() if k != pub_id})
@@ -160,7 +227,7 @@ class LedgerService:
                 }
                 self.store.flush()
 
-            # 阶段二：接收端接受并持久化首份摘要/回执。
+            # 阶段二：接收端接受并持久化该标识自己的首份摘要/回执。
             self.receiver_accept(pub_id, summary, amount)
 
             if crash_after_receive:
@@ -185,10 +252,11 @@ class LedgerService:
     def recover_pending(self) -> list[dict[str, Any]]:
         """重开时收敛所有未终结发布。
 
-        按发布标识查询接收端的冻结回执：查得到则将本端原发布（frozen）
-        收敛为 completed；查不到（断电早于接收端落盘的极端窗口）则保留
-        frozen，额度继续占用，留待恢复重试或相同载荷重传自愈。恢复重试
-        天然幂等，不会二次扣额或新增回执。
+        按发布标识查询**该标识自己**的接收端冻结回执：查得到则将本端原
+        发布（frozen）收敛为 completed；查不到（断电早于接收端落盘的极端
+        窗口）则保留 frozen，额度继续占用，留待恢复重试或相同载荷重传自
+        愈。恢复重试天然幂等，不会二次扣额或新增回执，也不会把另一发布
+        标识的接收证据当作本次结果。
         """
         recovered: list[dict[str, Any]] = []
         with self.store.lock:

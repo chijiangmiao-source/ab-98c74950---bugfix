@@ -4,10 +4,12 @@
 按顺序/并行执行三类检查，全部通过退出码 0，任一失败非零：
 
 1. 先构建交付页面静态制品并检查必备要素；
-2. 对编排中的交付服务做 API/HTTP 冒烟：正常交付、超额拒绝（接收端不新增
-   回执）、相同载荷重传幂等、改动摘要/额度冲突；
-3. 另起本地子进程实例做真实“接收后断电”演练（硬退出 → 重开 → 按发布
-   标识查询冻结回执并收敛 → 重开重试幂等）；
+2. 对编排中的交付服务做 API/HTTP 冒烟：正常交付、两个标识相同载荷各自
+   独立回执与计数、超额拒绝（接收端不新增回执）、相同载荷重传幂等、改动
+   摘要/额度冲突；
+3. 另起本地子进程实例做真实“接收后断电”演练：第一份相同载荷正常完成，
+   第二份相同载荷硬退出 → 重开 → 按发布标识查询本标识冻结回执并只收敛
+   第二份 → 重开重试幂等；
 4. 代码测试（pytest）与冒烟并行运行。
 """
 from __future__ import annotations
@@ -140,6 +142,44 @@ def step_http_smoke() -> None:
     status, state = http("GET", f"{BASE_URL}/api/state")
     check("冲突后额度与记录数不变", state.get("available") == 4 and len(state.get("publications", [])) == 1)
 
+    # 两个稳定发布标识以完全相同的摘要与额度提交：必须是两次可独立追溯
+    # 的交付——各自的接收方记录与回执、交付次数各 1，额度按两次提交扣减。
+    http("POST", f"{BASE_URL}/internal/reset")
+    dup_summary = "两个标识共用的完全相同匿名摘要"
+    status, dup1 = http("POST", f"{BASE_URL}/api/deliveries",
+                        {"publication_id": "DUP-1", "summary": dup_summary, "amount": 3})
+    check("首标识相同载荷交付受理（200）", status == 200 and dup1.get("stage") == "completed")
+    status, dup2 = http("POST", f"{BASE_URL}/api/deliveries",
+                        {"publication_id": "DUP-2", "summary": dup_summary, "amount": 3})
+    check("另一标识相同载荷同样受理（200）", status == 200 and dup2.get("stage") == "completed",
+          f"HTTP {status}")
+    check("两个标识的回执互不相同",
+          dup1.get("receipt_id") and dup1.get("receipt_id") != dup2.get("receipt_id"))
+    status, state = http("GET", f"{BASE_URL}/api/state")
+    check("接收端保留两份各自的接收记录",
+          [d["publication_id"] for d in state.get("deliveries", [])] == ["DUP-1", "DUP-2"])
+    check("两份接收记录交付次数各为 1",
+          [d["delivered_count"] for d in state.get("deliveries", [])] == [1, 1])
+    check("额度按两次提交扣减（3+3，可用 4）", state.get("available") == 4)
+    # 超额拒绝回归：6 > 剩余 4
+    status, over = http("POST", f"{BASE_URL}/api/deliveries",
+                        {"publication_id": "DUP-3", "summary": "再一批", "amount": 6})
+    check("双标识场景下超额仍被拒绝（402）", status == 402, f"HTTP {status}")
+    # 各自同载荷重传返回原回执、不扣额；改动载荷仍冲突
+    status, retry1 = http("POST", f"{BASE_URL}/api/deliveries",
+                          {"publication_id": "DUP-1", "summary": dup_summary, "amount": 3})
+    status, retry2 = http("POST", f"{BASE_URL}/api/deliveries",
+                          {"publication_id": "DUP-2", "summary": dup_summary, "amount": 3})
+    check("两个标识各自重传返回原回执",
+          retry1.get("receipt_id") == dup1.get("receipt_id")
+          and retry2.get("receipt_id") == dup2.get("receipt_id"))
+    check("重传后仍只有两份接收记录、可用仍为 4",
+          retry2.get("state", {}).get("available") == 4
+          and len(retry2.get("state", {}).get("deliveries", [])) == 2)
+    status, conflict_c = http("POST", f"{BASE_URL}/api/deliveries",
+                              {"publication_id": "DUP-2", "summary": "改动摘要", "amount": 3})
+    check("第二标识改动摘要仍冲突 409", status == 409, f"HTTP {status}")
+
 
 def _free_port() -> int:
     with socket.socket() as sock:
@@ -166,18 +206,28 @@ def step_crash_recovery() -> None:
     data_dir = tempfile.mkdtemp(prefix="crash-ledger-")
     data_file = os.path.join(data_dir, "ledger.json")
     url = f"http://127.0.0.1:{port}"
+    crash_summary = "两个标识共用的断电载荷"
+    crash_amount = 3
 
     proc = _start_local(port, data_file, auto_recover=False)
     try:
         check("断电演练实例就绪", wait_health(url))
+        # 第一份交付（标识 CRASH-A）以相同载荷正常完成
+        status, first = http("POST", f"{url}/api/deliveries",
+                             {"publication_id": "CRASH-A", "summary": crash_summary,
+                              "amount": crash_amount})
+        check("首份相同载荷交付正常完成", status == 200 and first.get("stage") == "completed",
+              f"HTTP {status}")
+        receipt_a = first.get("receipt_id")
+        # 第二份交付（标识 CRASH-B）相同载荷，选择“接收后断电”
         crashed = False
         try:
             http("POST", f"{url}/api/deliveries",
-                 {"publication_id": "CRASH-1", "summary": "断电载荷", "amount": 6,
-                  "crash_after_receive": True}, timeout=5)
+                 {"publication_id": "CRASH-B", "summary": crash_summary,
+                  "amount": crash_amount, "crash_after_receive": True}, timeout=5)
         except (urllib.error.URLError, ConnectionError, ConnectionResetError):
             crashed = True
-        check("提交后本端在记账完成前退出（连接中断）", crashed)
+        check("第二份提交后本端在记账完成前退出（连接中断）", crashed)
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -185,55 +235,81 @@ def step_crash_recovery() -> None:
         check("断电退出码为 99", proc.returncode == 99, f"rc={proc.returncode}")
 
         on_disk = json.load(open(data_file, encoding="utf-8"))
-        check("磁盘现场：本端发布停留在 frozen", on_disk["publications"]["CRASH-1"]["stage"] == "frozen")
-        check("磁盘现场：接收端已持久化首份回执", on_disk["deliveries"]["CRASH-1"]["delivered_count"] == 1)
-        check("磁盘现场：冻结额占用总额度（可用 4）",
+        check("磁盘现场：首份发布 completed",
+              on_disk["publications"]["CRASH-A"]["stage"] == "completed")
+        check("磁盘现场：第二份发布停留在 frozen",
+              on_disk["publications"]["CRASH-B"]["stage"] == "frozen")
+        disk_dels = on_disk["deliveries"]
+        check("磁盘现场：两个标识各自持久化接收记录",
+              set(disk_dels) == {"CRASH-A", "CRASH-B"}, str(sorted(disk_dels)))
+        check("磁盘现场：两份回执互不相同且各属本标识",
+              disk_dels.get("CRASH-A", {}).get("receipt_id") == receipt_a
+              and disk_dels.get("CRASH-B", {}).get("receipt_id")
+              and disk_dels["CRASH-B"]["receipt_id"] != receipt_a)
+        check("磁盘现场：两份接收记录交付次数各为 1",
+              [disk_dels[k]["delivered_count"] for k in ("CRASH-A", "CRASH-B")] == [1, 1])
+        check("磁盘现场：额度按两次提交占用（可用 4）",
               10 - sum(p["amount"] for p in on_disk["publications"].values()) == 4)
+        check("磁盘现场：不再残留跨标识载荷索引", "delivery_payloads" not in on_disk)
     finally:
         if proc.poll() is None:
             proc.kill()
 
-    # 重开（暂不自动恢复）：frozen 可查询
+    # 重开（暂不自动恢复）：CRASH-B frozen 可查询，两份接收记录都在
     proc = _start_local(port, data_file, auto_recover=False)
     try:
         check("断电后重开就绪", wait_health(url))
         status, state = http("GET", f"{url}/api/state")
-        check("重开后冻结额度 6、可用额度 4",
-              state.get("frozen_amount") == 6 and state.get("available") == 4)
-        pub = next((p for p in state["publications"] if p["publication_id"] == "CRASH-1"), None)
-        check("重开后发布阶段仍为 frozen（未终结保留额）", bool(pub and pub["stage"] == "frozen"))
-        check("重开后接收端交付次数仍为 1", state["deliveries"][0]["delivered_count"] == 1)
+        check("重开后冻结额度 3、可用额度 4",
+              state.get("frozen_amount") == 3 and state.get("available") == 4)
+        stages = {p["publication_id"]: p["stage"] for p in state.get("publications", [])}
+        check("重开后 CRASH-A completed、CRASH-B 仍 frozen",
+              stages == {"CRASH-A": "completed", "CRASH-B": "frozen"}, str(stages))
+        check("重开后两份接收记录仍各为 1 次",
+              sorted((d["publication_id"], d["delivered_count"])
+                     for d in state.get("deliveries", [])) == [("CRASH-A", 1), ("CRASH-B", 1)])
 
-        # 按发布标识查询冻结回执并收敛为原发布完成
+        # 按发布标识查询冻结回执并收敛第二份发布（不得借用 CRASH-A 的证据）
         status, recovered = http("POST", f"{url}/api/recover", {})
-        check("收敛接口返回 200 且收敛 1 个发布",
-              status == 200 and len(recovered.get("recovered", [])) == 1)
-        check("收敛后阶段为 completed",
+        check("收敛接口返回 200 且仅收敛 CRASH-B",
+              status == 200
+              and [p.get("publication_id") for p in recovered.get("recovered", [])] == ["CRASH-B"])
+        check("收敛后 CRASH-B 阶段为 completed",
               recovered.get("recovered", [{}])[0].get("stage") == "completed")
     finally:
         proc.terminate()
         proc.wait(timeout=10)
 
-    # 再次重开 + 恢复重试：一条记录、一份回执、一次冻结
+    # 再次重开 + 恢复重试：两份发布、两份回执、各一次冻结
     proc = _start_local(port, data_file, auto_recover=True)
     try:
         check("收敛后再次重开就绪", wait_health(url))
         status, state = http("GET", f"{url}/api/state")
-        check("最终：仅一条发布记录", len(state.get("publications", [])) == 1)
-        check("最终：仅一份接收回执且交付次数为 1",
-              len(state.get("deliveries", [])) == 1 and state["deliveries"][0]["delivered_count"] == 1)
-        check("最终：冻结 0、可用 4",
+        check("最终：两条发布记录均完成",
+              len(state.get("publications", [])) == 2
+              and all(p["stage"] == "completed" for p in state["publications"]))
+        check("最终：两份接收回执且交付次数各为 1",
+              sorted((d["publication_id"], d["receipt_id"], d["delivered_count"])
+                     for d in state.get("deliveries", [])) == [
+                  ("CRASH-A", receipt_a, 1),
+                  ("CRASH-B", disk_dels["CRASH-B"]["receipt_id"], 1),
+              ])
+        check("最终：冻结 0、可用 4（额度只扣两次）",
               state.get("frozen_amount") == 0 and state.get("available") == 4)
-        receipt = state["publications"][0]["receipt_id"]
 
-        status, retry = http("POST", f"{url}/api/deliveries",
-                             {"publication_id": "CRASH-1", "summary": "断电载荷", "amount": 6})
-        check("恢复后同载荷重传返回原回执", status == 200 and retry.get("receipt_id") == receipt)
-        check("恢复后重传不再扣额", retry.get("state", {}).get("available") == 4)
+        for pub_id in ("CRASH-A", "CRASH-B"):
+            status, retry = http("POST", f"{url}/api/deliveries",
+                                 {"publication_id": pub_id, "summary": crash_summary,
+                                  "amount": crash_amount})
+            check(f"恢复后 {pub_id} 同载荷重传返回原回执且不扣额",
+                  status == 200
+                  and retry.get("receipt_id")
+                  and retry.get("state", {}).get("available") == 4)
         status, state = http("GET", f"{url}/api/state")
-        check("恢复后重传仍为一条记录/一份回执/次数 1",
-              len(state["publications"]) == 1 and len(state["deliveries"]) == 1
-              and state["deliveries"][0]["delivered_count"] == 1)
+        check("恢复后重传仍为两条记录/两份回执/次数各 1",
+              len(state.get("publications", [])) == 2
+              and len(state.get("deliveries", [])) == 2
+              and sorted(d["delivered_count"] for d in state["deliveries"]) == [1, 1])
     finally:
         proc.terminate()
         proc.wait(timeout=10)

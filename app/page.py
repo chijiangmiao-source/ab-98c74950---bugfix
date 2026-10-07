@@ -54,7 +54,7 @@ label.check { font-size: 12px; color: #6b7280; display: flex; gap: 4px; align-it
 <body>
 <header>
   <h1>匿名统计交付 · 总额度账本</h1>
-  <div class="meta">研究机构 → 协作方 ｜ 稳定发布标识 ｜ 首份摘要与接收方回执持久化</div>
+  <div class="meta">研究机构 → 协作方 ｜ 稳定发布标识 ｜ 每个标识各自持久化首份摘要与接收方回执</div>
 </header>
 <main>
   <div class="cards" id="cards"><!-- 额度总览 --></div>
@@ -82,7 +82,7 @@ label.check { font-size: 12px; color: #6b7280; display: flex; gap: 4px; align-it
   </section>
 
   <section class="panel">
-    <h2>接收方回执（接收端持久化，交付次数恒为 1）</h2>
+    <h2>接收方回执（接收端按发布标识持久化，每个标识交付次数恒为 1）</h2>
     <table>
       <thead><tr><th>发布标识</th><th>首份摘要指纹</th><th>金额</th><th>接收方回执</th><th>交付次数</th></tr></thead>
       <tbody id="receipts"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>

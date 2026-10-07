@@ -52,6 +52,33 @@ def test_delivery_rejection_conflict_and_idempotency(tmp_path):
     assert body["state"]["available"] == 4
 
 
+def test_two_publications_same_payload_get_distinct_receipts(tmp_path):
+    client = make_app(tmp_path).test_client()
+
+    first = client.post("/api/deliveries", json={"publication_id": "PUB-1", "summary": "相同摘要", "amount": 3})
+    second = client.post("/api/deliveries", json={"publication_id": "PUB-2", "summary": "相同摘要", "amount": 3})
+    assert first.status_code == 200 and second.status_code == 200
+    r1 = first.get_json()
+    r2 = second.get_json()
+    assert r1["stage"] == r2["stage"] == "completed"
+    assert r1["receipt_id"] != r2["receipt_id"]
+    # 额度按两次提交扣减
+    assert r2["state"]["available"] == 4
+
+    state = client.get("/api/state").get_json()
+    assert [d["publication_id"] for d in state["deliveries"]] == ["PUB-1", "PUB-2"]
+    assert all(d["delivered_count"] == 1 for d in state["deliveries"])
+
+    # 各自同载荷重传仍是原回执，不扣额
+    retry1 = client.post("/api/deliveries", json={"publication_id": "PUB-1", "summary": "相同摘要", "amount": 3})
+    retry2 = client.post("/api/deliveries", json={"publication_id": "PUB-2", "summary": "相同摘要", "amount": 3})
+    assert retry1.get_json()["receipt_id"] == r1["receipt_id"]
+    assert retry2.get_json()["receipt_id"] == r2["receipt_id"]
+    state = client.get("/api/state").get_json()
+    assert len(state["deliveries"]) == 2
+    assert state["available"] == 4
+
+
 def test_bad_payload_returns_400(tmp_path):
     client = make_app(tmp_path).test_client()
     assert client.post("/api/deliveries", json={"publication_id": "", "summary": "x", "amount": 1}).status_code == 400

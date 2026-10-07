@@ -3,12 +3,13 @@
 一个 JSON 文件承载两部分概念上独立的数据：
 
 - ``publications``：本端（数据官/发送方）额度账本，按稳定发布标识索引；
-- ``deliveries`` ：接收端持久化的交付记录（首份摘要与回执），按同一标识索引。
+- ``deliveries`` ：接收端持久化的交付记录（首份摘要与回执），按同一
+  发布标识索引；不同标识即使载荷完全相同也各自独立成一条记录。
 
 每次写入整库序列化到同目录临时文件，``fsync`` 后以 ``os.replace`` 原子
 替换。进程在两次落盘之间被硬杀（模拟断电）时，磁盘上只可能是完整的旧版
 或完整的新版，不会出现半份文件。所有变更在同一把可重入锁内进行，保证
-并发相同提交被串行化。
+同一发布标识的并发相同提交被串行化。
 """
 from __future__ import annotations
 
@@ -27,7 +28,6 @@ class JsonStore:
             "version": 1,
             "publications": {},
             "deliveries": {},
-            "delivery_payloads": {},
         }
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as fh:
@@ -39,7 +39,6 @@ class JsonStore:
                 self.data.update(loaded)
         self.data.setdefault("publications", {})
         self.data.setdefault("deliveries", {})
-        self.data.setdefault("delivery_payloads", {})
 
     def flush(self) -> None:
         """将当前内存状态原子落盘（调用方须持有 ``self.lock``）。"""
